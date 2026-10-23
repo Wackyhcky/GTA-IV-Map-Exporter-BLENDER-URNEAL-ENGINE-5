@@ -53,6 +53,9 @@ DETAIL_SHARE = {"FULL": 1.0, "HIGH": 0.7, "MEDIUM": 0.35, "LOW": 0.17, "VERYLOW"
 UE_CONVERT_SHARE = 0.3
 UE_BATCHES_PER_PASS = 12
 UE_MAX_RETRIES = 4
+# bump when imported characters must be rebuilt from scratch (v2: shared skeleton and rig from a
+# reference ped; v1 could take them from a ped whose skeleton faces backwards)
+CHARACTERS_VERSION = 3  # v3: arm twist bones follow the arm
 # measured: full map in Blender ~2.7 GB textures + 0.85 GB .blend;
 # Unreal ~0.72 GB (export + imported assets) for manhat01, scaled to the full map
 FULL_MAP_BYTES = {"BLENDER": 3.6e9, "UNREAL": 9e9}
@@ -195,6 +198,27 @@ def bundled_traffic_plugin():
     return None
 
 
+def stage_radio_data(project_dir, log):
+    """Packaged games need Content/GTAIV/RadioData (plain files, not assets): stage it with the game
+    (Config/DefaultGame.ini, backed up first)."""
+    ini = os.path.join(project_dir, "Config", "DefaultGame.ini")
+    line = '+DirectoriesToAlwaysStageAsNonUFS=(Path="GTAIV/RadioData")'
+    text = open(ini, encoding="utf-8").read() if os.path.isfile(ini) else ""
+    if line in text:
+        return
+    if text:
+        shutil.copy2(ini, ini + ".bak_before_gtaiv_radio")
+    section = "[/Script/UnrealEd.ProjectPackagingSettings]"
+    if section in text:
+        text = text.replace(section, section + "\n" + line, 1)
+    else:
+        text = text.rstrip("\n") + "\n\n" + section + "\n" + line + "\n"
+    os.makedirs(os.path.dirname(ini), exist_ok=True)
+    with open(ini, "w", encoding="utf-8") as f:
+        f.write(text)
+    log("Packaging: Content/GTAIV/RadioData is staged with the game (DefaultGame.ini)")
+
+
 def install_traffic_plugin(uproject, log):
     """Copy the plugin into <project>/Plugins and enable it in the .uproject (backed up first)."""
     src = bundled_traffic_plugin()
@@ -224,6 +248,48 @@ def install_traffic_plugin(uproject, log):
             json.dump(proj, f, indent="\t")
         log("Enabled GTAIVTraffic in %s (backup: .uproject.bak)" % os.path.basename(uproject))
     return True
+
+
+STARTUP_MAP = "/Game/GTAIV/Frontend/GTAIV_Startup.GTAIV_Startup"
+
+
+def startup_level(ini):
+    """The project's game startup level (what Start New Game opens), ignoring our own startup map."""
+    for path in (ini, ini + ".bak_before_gtaiv_startup"):
+        try:
+            for line in open(path, encoding="utf-8", errors="replace"):
+                if line.startswith("GameDefaultMap="):
+                    v = line.split("=", 1)[1].strip()
+                    if v and v != STARTUP_MAP:
+                        return v.split(".")[0]
+        except OSError:
+            pass
+    return ""
+
+
+def set_startup_level(ini, level, log):
+    """GameDefaultMap = level in DefaultEngine.ini (the original is kept as a .bak once)."""
+    try:
+        text = open(ini, encoding="utf-8", errors="replace").read()
+    except OSError:
+        text = ""
+    if "GameDefaultMap=%s" % level in text:
+        return
+    bak = ini + ".bak_before_gtaiv_startup"
+    if text and not os.path.isfile(bak):
+        shutil.copy2(ini, bak)
+    sec = "[/Script/EngineSettings.GameMapsSettings]"
+    lines = text.splitlines()
+    if any(l.startswith("GameDefaultMap=") for l in lines):
+        lines = ["GameDefaultMap=%s" % level if l.startswith("GameDefaultMap=") else l for l in lines]
+    elif sec in lines:
+        i = lines.index(sec)
+        lines.insert(i + 1, "GameDefaultMap=%s" % level)
+    else:
+        lines += ["", sec, "GameDefaultMap=%s" % level]
+    with open(ini, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    log("The game now starts with the GTA IV startup (%s; backup: %s)" % (level, os.path.basename(bak)))
 
 
 def load_settings():
@@ -257,8 +323,56 @@ EXTRAS = (  # (setting, label, applies to Blender)
     ("interiors", "Interiors", True),
     ("lights", "Lights", True),
     ("traffic", "Traffic", False),
-    ("characters", "Characters & weapons", False),
 )
+PREVIEW = 128  # character/item preview size (px)
+PREVIEW_VERSION = 1
+CHAR_GROUPS = (("story", "Niko & story"), ("men", "Men"), ("women", "Women"), ("weapons", "Weapons"),
+               ("items", "Held items"), ("cars", "Cars"), ("service", "Emergency & work"))
+GALLERIES = {  # tab -> (title, groups, export button, explanation)
+    "characters": ("Characters", CHAR_GROUPS[:3], "Export characters to Unreal",
+                   "Peds and Niko go to Content/GTAIV/Characters in your Unreal project, without touching the map. "
+                   "In a Game Animation Sample project they get GASP's animation: the player becomes Niko and the "
+                   "peds walk the sidewalks of an exported map."),
+    "vehicles": ("Vehicles", CHAR_GROUPS[5:], "Export vehicles to Unreal",
+                 "Every car of the game, drivable in Unreal with its own handling.dat physics (mass, suspension, "
+                 "traction, gears, brakes, steering). In the game press F next to a car to get in (traffic cars too), "
+                 "and Page Up/Down to put any exported vehicle in front of you."),
+    "weapons": ("Weapons", CHAR_GROUPS[3:5], "Export weapons to Unreal",
+                "Weapons and held items go to Content/GTAIV/Meshes (SM_WPN_*) in your Unreal project as static "
+                "meshes with their materials, without touching the map."),
+}
+
+
+SERVICE_VEHICLES = ("police", "police2", "noose", "nstockade", "fbi", "ambulance", "firetruk", "pstockade",
+                    "polpatriot", "taxi", "taxi2", "cabby", "bus", "trash", "flatbed", "biff", "mule", "benson",
+                    "yankee", "packer", "phantom", "steed", "boxville", "pony", "speedo", "burrito", "burrito2",
+                    "airtug", "forklift", "ripley", "rebla", "stockade", "securicar")
+
+
+def char_group(kind, name):
+    if kind == "veh":
+        return "service" if name in SERVICE_VEHICLES else "cars"
+    if kind == "ped":
+        if name == "player" or name.startswith("ig_"):
+            return "story"
+        return "women" if name.startswith("f_") else "men"
+    return "weapons" if name.startswith("w_") else "items"
+
+
+def char_title(name):
+    """Readable name: player -> Niko Bellic, ig_brucie -> Brucie, m_y_business_01 -> Business 01."""
+    if name == "player":
+        return "Niko Bellic"
+    for p in ("ig_", "m_y_", "m_m_", "m_o_", "f_y_", "f_m_", "f_o_", "w_", "amb_", "cs_"):
+        if name.startswith(p):
+            name = name[len(p):]
+            break
+    return name.replace("_", " ").strip().title()
+
+
+def preview_path(key):
+    kind, name = key.split(":", 1)
+    return os.path.join(SETTINGS_DIR, "previews", "v%d" % PREVIEW_VERSION, "%s_%s.png" % (kind, name))
 
 
 def plural(n, word):
@@ -303,10 +417,24 @@ class App(tk.Tk):
         self.traffic = tk.BooleanVar(value=s.get("traffic", True))
         self.characters = tk.BooleanVar(value=s.get("characters", False))
         self.nanite = tk.BooleanVar(value=s.get("nanite", False))
+        # GTA IV's draw distances + LOD models, and reduced mesh LODs (much better frame rate)
+        self.map_lods = tk.BooleanVar(value=s.get("map_lods", True))
         self.collision = tk.BooleanVar(value=s.get("collision", True))
         self.keep_files = tk.BooleanVar(value=s.get("keep_files", False))
+        self.radio = tk.BooleanVar(value=s.get("radio", True))
         self.search = tk.StringVar()
+        self.gal = {}
+        self.ui_frontend = tk.BooleanVar(value=s.get("ui_frontend", True))
+        self.ui_hud = tk.BooleanVar(value=s.get("ui_hud", True))
+        self.ui_startup = tk.BooleanVar(value=s.get("ui_startup", True))
         self._saved_areas = set(s.get("areas", []))
+        self._saved_chars = set(s["characters_selected"]) if "characters_selected" in s else None
+        self.char_vars, self.char_tiles, self.char_group_of = {}, {}, {}
+        self._previews = {}
+        self._game_key = None
+        self._closing = False
+        self._last_kind = None
+        self._preview_thread = None
 
         from gtaiv_exporter.mapdata import DETAIL_LEVELS
         self._detail_levels = DETAIL_LEVELS
@@ -316,7 +444,7 @@ class App(tk.Tk):
         dark_title_bar(self)
         for v in (self.game_dir, self.blender, self.unreal, self.uproject, self.output, self.map_name):
             v.trace_add("write", lambda *a: self._check_paths())
-        for v in (self.textures, self.interiors, self.lights, self.traffic, self.characters, self.detail,
+        for v in (self.textures, self.interiors, self.lights, self.traffic, self.detail,
                   self.mode, self.ue_mode):
             v.trace_add("write", lambda *a: self._update_summary())
         self.target.trace_add("write", lambda *a: self._target_changed())
@@ -329,8 +457,8 @@ class App(tk.Tk):
             self.after(200, self.scan)
 
     # ------------------------------------------------------------ small builders
-    def _label(self, parent, text="", font=None, fg=FG, bg=CARD, **kw):
-        return tk.Label(parent, text=text, font=font or self.f.body, fg=fg, bg=bg, anchor="w", justify="left", **kw)
+    def _label(self, parent, text="", font=None, fg=FG, bg=CARD, anchor="w", justify="left", **kw):
+        return tk.Label(parent, text=text, font=font or self.f.body, fg=fg, bg=bg, anchor=anchor, justify=justify, **kw)
 
     def _page_header(self, page, title):
         head = tk.Frame(page, bg=CONTENT)
@@ -374,7 +502,9 @@ class App(tk.Tk):
         card.pack(fill="x", padx=36, pady=(0, 12))
         self._label(card.body, title, font=self.f.section).pack(anchor="w")
         if subtitle:
-            self._label(card.body, subtitle, font=self.f.small, fg=FG3).pack(anchor="w", pady=(2, 0))
+            sub = self._label(card.body, subtitle, font=self.f.small, fg=FG3, wraplength=900)
+            sub.pack(anchor="w", pady=(2, 0), fill="x")
+            card.body.bind("<Configure>", lambda e, w=sub: w.configure(wraplength=max(200, e.width - 8)), add="+")
         body = tk.Frame(card.body, bg=CARD)
         body.pack(fill="x", pady=(10, 0))
         body.columnconfigure(1, weight=1)
@@ -417,7 +547,11 @@ class App(tk.Tk):
         self.side.pack(side="left", fill="y")
         self.side.pack_propagate(False)
         self.nav = {
-            "districts": NavItem(self.side, "grid", "Districts", lambda: self._show("districts"), self.f),
+            "districts": NavItem(self.side, "grid", "Map", lambda: self._show("districts"), self.f),
+            "characters": NavItem(self.side, "person", "Characters", lambda: self._show("characters"), self.f),
+            "weapons": NavItem(self.side, "star", "Weapons", lambda: self._show("weapons"), self.f),
+            "vehicles": NavItem(self.side, "car", "Vehicles", lambda: self._show("vehicles"), self.f),
+            "ui": NavItem(self.side, "play", "Game UI", lambda: self._show("ui"), self.f),
             "export": NavItem(self.side, "list", "Export", lambda: self._show("export"), self.f),
             "settings": NavItem(self.side, "settings", "Settings", lambda: self._show("settings"), self.f),
         }
@@ -441,7 +575,13 @@ class App(tk.Tk):
         holder.grid_rowconfigure(0, weight=1)
         holder.grid_columnconfigure(0, weight=1)
         self.pages = {}
-        for name, build in (("districts", self._build_districts), ("export", self._build_export),
+        self._placeholder = tk.PhotoImage(width=PREVIEW, height=PREVIEW)
+        for name, build in (("districts", self._build_districts),
+                            ("characters", lambda pg: self._build_gallery(pg, "characters")),
+                            ("weapons", lambda pg: self._build_gallery(pg, "weapons")),
+                            ("vehicles", lambda pg: self._build_gallery(pg, "vehicles")),
+                            ("ui", self._build_ui),
+                            ("export", self._build_export),
                             ("settings", self._build_settings)):
             page = tk.Frame(holder, bg=CONTENT)
             page.grid(row=0, column=0, sticky="nsew")
@@ -470,14 +610,14 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ districts page
     def _build_districts(self, page):
-        self.dist_sub = self._page_header(page, "Districts")
+        self.dist_sub = self._page_header(page, "Map")
         bar = self._button_bar(page)
         self.rescan_btn = self._btn(bar, "Rescan", self.scan, icon="refresh")
         self.rescan_btn.pack(side="left", padx=(0, 8))
         self.all_btn = self._btn(bar, "Select all", lambda: self._select_all(True), icon="add")
         self.all_btn.pack(side="left", padx=(0, 8))
         self._btn(bar, "Select none", lambda: self._select_all(False)).pack(side="left", padx=(0, 8))
-        self.export_btn2 = self._btn(bar, "Export", self.export, accent=True, icon="play")
+        self.export_btn2 = self._btn(bar, "Export map", lambda: self.export("map"), accent=True, icon="play")
         self.export_btn2.pack(side="left")
 
         cards = tk.Frame(page, bg=CONTENT)
@@ -506,6 +646,331 @@ class App(tk.Tk):
         self.table.pack(fill="both", expand=True)
         self.empty = self._label(self.table.inner, "Choose your GTA IV folder in Settings to list districts.", fg=FG3)
         self.empty.pack(anchor="w", pady=20, padx=4)
+
+    # ------------------------------------------------------------ characters / weapons pages
+    def _build_gallery(self, page, gname):
+        title, groups, button, info = GALLERIES[gname]
+        g = self.gal[gname] = {"search": tk.StringVar(), "filter": tk.StringVar(value="all"), "cols": 0,
+                               "groups": [k for k, _ in groups]}
+        g["sub"] = self._page_header(page, title)
+        bar = self._button_bar(page)
+        g["all_btn"] = self._btn(bar, "Select all", lambda: self._char_select(gname, True), icon="add")
+        g["all_btn"].pack(side="left", padx=(0, 8))
+        self._btn(bar, "Select none", lambda: self._char_select(gname, False)).pack(side="left", padx=(0, 8))
+        g["export_btn"] = self._btn(bar, button, lambda: self.export(gname), accent=True, icon="play")
+        g["export_btn"].pack(side="left")
+
+        card = Card(page)
+        card.pack(fill="x", padx=36, pady=(18, 0))
+        self._label(card.body, info, font=self.f.small, fg=FG2, wraplength=1000).pack(anchor="w", fill="x")
+        if gname == "vehicles":
+            ttk.Checkbutton(card.body, text="Car radio: every GTA IV station with its DJs, adverts, news and "
+                            "weather (about 2.3 GB in the project)", variable=self.radio,
+                            style="Card.Switch.TCheckbutton").pack(anchor="w", pady=(10, 0))
+
+        grid = Card(page, fill=True, pad=(16, 14))
+        grid.pack(fill="both", expand=True, padx=36, pady=(12, 24))
+        gb = grid.body
+        top = tk.Frame(gb, bg=CARD)
+        top.pack(fill="x")
+        SearchBox(top, g["search"], "Search %s" % title.lower(), self.f).pack(side="left")
+        chips = tk.Frame(top, bg=CARD)
+        chips.pack(side="left", padx=(18, 0))
+        for key, label in (("all", "All"),) + groups:
+            ttk.Radiobutton(chips, text=label, variable=g["filter"], value=key,
+                            style="Card.TRadiobutton").pack(side="left", padx=(0, 14))
+        tk.Frame(gb, bg=LINE, height=1).pack(fill="x", pady=(12, 0))
+        g["scroll"] = Scroll(gb)
+        g["scroll"].pack(fill="both", expand=True)
+        self._label(g["scroll"].inner, "Choose your GTA IV folder in Settings to list them.", fg=FG3).pack(
+            anchor="w", pady=20, padx=4)
+        g["scroll"].canvas.bind("<Configure>", lambda e: self._char_relayout(gname), add="+")
+        for v in (g["search"], g["filter"]):
+            v.trace_add("write", lambda *a: (self._char_relayout(gname, force=True), self._char_changed()))
+
+    def _gallery_of(self, key):
+        grp = self.char_group_of[key]
+        return next(n for n, g in self.gal.items() if grp in g["groups"])
+
+    def _populate_characters(self, items):
+        """items: [(key, group)] where key is "ped:<name>" or "item:<name>"."""
+        for g in self.gal.values():
+            for w in g["scroll"].inner.winfo_children():
+                w.destroy()
+        self.char_vars, self.char_tiles, self.char_group_of = {}, {}, {}
+        saved = self._saved_chars
+        for key, group in items:
+            v = tk.BooleanVar(value=(key in saved) if saved is not None else True)
+            self.char_vars[key] = v
+            self.char_group_of[key] = group
+            self.char_tiles[key] = self._make_char_tile(key, v)
+            v.trace_add("write", lambda *a, k=key: self._char_changed(k))
+        for gname in self.gal:
+            self._char_relayout(gname, force=True)
+        self._char_changed()
+        self._start_previews([k for k, _ in items])
+
+    def _make_char_tile(self, key, var):
+        kind, name = key.split(":", 1)
+        parent = self.gal[self._gallery_of(key)]["scroll"].inner
+        f = tk.Frame(parent, bg=CARD, highlightthickness=2, highlightbackground=CARD,
+                     cursor="hand2", padx=6, pady=6)
+        img = tk.Label(f, image=self._preview_image(key) or self._placeholder, bg=CARD, bd=0)
+        img.pack()
+        title = self._label(f, char_title(name), font=self.f.strong, width=17, anchor="center", justify="center")
+        title.pack(fill="x", pady=(4, 0))
+        sub = self._label(f, name if name != "player" else "playerped.rpf", font=self.f.small, fg=FG3,
+                          anchor="center", justify="center")
+        sub.pack(fill="x")
+        state = self._label(f, "", font=self.f.small, anchor="center", justify="center")
+        state.pack(fill="x")
+        for w in (f, img, title, sub, state):
+            w.bind("<Button-1>", lambda e: var.set(not var.get()))
+        return {"frame": f, "img": img, "state": state, "title": title}
+
+    def _preview_image(self, key):
+        if key in self._previews:
+            return self._previews[key]
+        path = preview_path(key)
+        if os.path.isfile(path):
+            try:
+                self._previews[key] = tk.PhotoImage(file=path)
+                return self._previews[key]
+            except tk.TclError:
+                pass
+        return None
+
+    def _char_shown(self, gname):
+        g = self.gal[gname]
+        q = g["search"].get().strip().lower()
+        flt = g["filter"].get()
+        return [k for k in self.char_vars
+                if self.char_group_of[k] in g["groups"] and (flt == "all" or self.char_group_of[k] == flt)
+                and (not q or q in k.lower() or q in char_title(k.split(":", 1)[1]).lower())]
+
+    def _char_relayout(self, gname, force=False):
+        g = self.gal[gname]
+        if not self.char_tiles:
+            return
+        width = g["scroll"].canvas.winfo_width()
+        cols = max(1, (width - 8) // (PREVIEW + 30))
+        if cols == g["cols"] and not force:
+            return
+        g["cols"] = cols
+        for k, t in self.char_tiles.items():
+            if self.char_group_of[k] in g["groups"]:
+                t["frame"].grid_forget()
+        for i, k in enumerate(self._char_shown(gname)):
+            self.char_tiles[k]["frame"].grid(row=i // cols, column=i % cols, padx=4, pady=4, sticky="n")
+        g["scroll"].to_top()
+
+    def _char_select(self, gname, value):
+        for k in self._char_shown(gname):  # what the filter/search shows
+            self.char_vars[k].set(value)
+
+    def _char_changed(self, key=None):
+        for k in ([key] if key else self.char_vars):
+            on = self.char_vars[k].get()
+            t = self.char_tiles[k]
+            t["frame"].configure(highlightbackground=ACCENT if on else CARD)
+            t["state"].configure(text="✔  Added" if on else "Click to add", fg=ACCENT if on else FG3)
+        peds, items = self._char_selection()
+        for gname, g in self.gal.items():
+            keys = [k for k in self.char_vars if self.char_group_of[k] in g["groups"]]
+            done = sum(1 for k in keys if k in self._previews or os.path.isfile(preview_path(k)))
+            chosen = len(peds) if gname == "characters" else len(
+                [i for i in items if i.startswith("veh:") == (gname == "vehicles")])
+            g["sub"].configure(text="%d of %d selected%s" % (
+                chosen, len(keys), "" if done >= len(keys) else " · drawing previews %d / %d" % (done, len(keys))))
+            g["all_btn"].configure(text="%s  Select all (%d)" % (ICONS["add"], len(self._char_shown(gname))))
+            if not self._running():
+                g["export_btn"].state(["!disabled"] if chosen else ["disabled"])
+
+    def _char_selection(self):
+        peds = [k.split(":", 1)[1] for k, v in self.char_vars.items() if v.get() and k.startswith("ped:")]
+        items = [k.split(":", 1)[1] for k, v in self.char_vars.items() if v.get() and k.startswith("item:")]
+        items += [k for k, v in self.char_vars.items() if v.get() and k.startswith("veh:")]
+        return peds, items
+
+    def _start_previews(self, keys):
+        todo = [k for k in keys if not os.path.isfile(preview_path(k))]
+        if not todo or self._preview_thread:
+            return
+        gd, key = self.game_dir.get(), self._game_key
+
+        def work():
+            try:
+                from gtaiv_exporter.peds import PedArchive
+                from gtaiv_exporter.preview import render
+                pa = PedArchive(gd, key)
+                os.makedirs(os.path.dirname(preview_path(todo[0])), exist_ok=True)
+                for k in todo:
+                    if self._closing:
+                        break
+                    kind, name = k.split(":", 1)
+                    try:
+                        if kind == "ped" and name == "player":
+                            p = pa.player()
+                            im = render(p.mesh, pa.player_textures(p), PREVIEW) if p else None
+                        elif kind == "ped":
+                            p = pa.ped(name)
+                            im = render(p.mesh, pa.textures(name), PREVIEW) if p else None
+                        elif kind == "veh":
+                            im = self._vehicle_preview(name, render)
+                        else:
+                            m = pa.weapon(name)
+                            im = render(m, pa.textures(name), PREVIEW, kind="item") if m else None
+                        if im is not None:
+                            im.save(preview_path(k))
+                            self.q.put(("preview", k))
+                    except Exception as e:
+                        self.q.put(("log", "No preview for %s: %s" % (name, e)))
+                pa.close()
+            except Exception as e:
+                self.q.put(("log", "Previews stopped: %s" % e))
+            finally:
+                self._preview_thread = None
+        self._preview_thread = threading.Thread(target=work, daemon=True)
+        self._preview_thread.start()
+
+    def _vehicle_preview(self, name, render):
+        from gtaiv_exporter.vehicles import VehicleArchive, load_vehicle_defs
+        if not hasattr(self, "_va"):
+            self._vdefs, self._vtxdp = load_vehicle_defs(self.game_dir.get())
+            self._va = VehicleArchive(self.game_dir.get(), self._game_key)
+        d = self._vdefs.get(name)
+        vm = self._va.model(name)
+        if vm is None or vm.body is None or d is None:
+            return None
+        tex, t, seen = {}, d.txd, []
+        while t and t not in seen:
+            seen.append(t)
+            t = self._vtxdp.get(t)
+        for t in reversed(seen + ["vehshare"]):
+            tex.update(self._va.textures(t))
+        return render(vm.body, tex, PREVIEW, kind="vehicle",
+                      paint=max(d.colors, key=lambda c: sum(c[0])) if d.colors else None)
+
+    # ------------------------------------------------------------ game UI page
+    def _build_ui(self, page):
+        self.ui_sub = self._page_header(page, "Game UI")
+        self.ui_sub.configure(text="GTA IV's startup, menus and HUD, rebuilt in Unreal from the game's files")
+        bar = self._button_bar(page)
+        self.ui_export_btn = self._btn(bar, "Export game UI to Unreal", self.export_ui, accent=True, icon="play")
+        self.ui_export_btn.pack(side="left")
+        sc = Scroll(page, bg=CONTENT)
+        sc.pack(fill="both", expand=True, pady=(18, 0))
+        p = sc.inner
+        a = self._settings_card(p, "Startup and menus", "Legal screens, the Rockstar Games / Rockstar North / GTA IV "
+                                                        "logos and the loading screens, timed by the game's "
+                                                        "loadingscreens_pc.dat, then the PC title menu with the "
+                                                        "Options, Graphics, Audio, Display and Controls pages "
+                                                        "(frontend_menus.xml), drawn with GTA IV's own font.")
+        self._switches(a, 0, (("Startup sequence and menus", self.ui_frontend),
+                              ("Make it the game's startup map", self.ui_startup)))
+        self._label(a, "Start New Game opens the project's current startup level. Settings are applied to "
+                       "Unreal's graphics, window and audio settings and saved between runs. The project's "
+                       "DefaultEngine.ini is backed up before the startup map is changed.", font=self.f.small,
+                    fg=FG3, wraplength=820).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        h = self._settings_card(p, "In-game HUD", "The radar (GTA IV's minimap tiles, rotating with the camera, "
+                                                  "zooming with speed) with the health and armour ring, north, "
+                                                  "waypoint and blips; cash, wanted stars, weapon icon, area names "
+                                                  "(info.zon), help messages and subtitles, laid out from hud.dat.")
+        self._switches(h, 0, (("In-game HUD", self.ui_hud),))
+        self._label(h, "It becomes the HUD of the GM_GTAIV game mode (export the characters first in a Game "
+                       "Animation Sample project); anywhere else, set GTAIVPlayerHUD as the HUD class. Health, "
+                       "armour, money, wanted level, help text, subtitles, waypoint and blips can be set from "
+                       "Blueprints.", font=self.f.small, fg=FG3, wraplength=820).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        tk.Frame(p, bg=CONTENT, height=12).pack()
+
+    def export_ui(self):
+        g_ok, _ = self._check_paths()
+        up = self.uproject.get()
+        if not g_ok:
+            messagebox.showerror(APP_NAME, "Pick the GTA IV folder (the one that contains GTAIV.exe).")
+            return
+        if not (up.lower().endswith(".uproject") and os.path.isfile(up) and os.path.isfile(self._unreal_cmd())):
+            messagebox.showerror(APP_NAME, "Pick an Unreal project (.uproject) and the Unreal Editor in Settings.")
+            return
+        if not (self.ui_frontend.get() or self.ui_hud.get()):
+            messagebox.showerror(APP_NAME, "Turn on the startup/menus or the HUD.")
+            return
+        if unreal_running() and not messagebox.askyesno(
+                APP_NAME, "Unreal Editor is running.\n\nClose it first if it has this project open, otherwise the "
+                          "import can't save its files.\n\nContinue anyway?"):
+            return
+        self._persist()
+        self._chars_only_run = False
+        self._last_kind = "ui"
+        self._result = None
+        self.cancelled = False
+        self.start_time = time.time()
+        self._busy(True)
+        self._show("export")
+        self.pct.configure(text="0%", fg=FG)
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self.exp_sub.configure(text="Unreal Engine · game UI")
+        self._log("Exporting GTA IV's game UI to Unreal")
+        project_dir = os.path.dirname(up)
+        out = os.path.join(project_dir, "Saved", "GTAIV_UI")
+        self._worker_busy = True
+        log = lambda m: self.q.put(("log", m))
+
+        def work():
+            try:
+                from gtaiv_exporter import mapdata
+                from gtaiv_exporter.frontend import export_frontend
+                from gtaiv_exporter.hud import export_hud
+                key = mapdata.GameData(self.game_dir.get(), log=log,
+                                       key_cache=os.path.join(SETTINGS_DIR, "gta4_key.bin")).key
+                fe_dir, hud_dir = os.path.join(out, "frontend"), os.path.join(out, "hud")
+                if self.ui_frontend.get():
+                    self.q.put(("progress", (0.05, "Reading the startup and menu files")))
+                    export_frontend(self.game_dir.get(), key, fe_dir, log=log)
+                if self.ui_hud.get():
+                    self.q.put(("progress", (0.15, "Reading the HUD and radar files")))
+                    export_hud(self.game_dir.get(), key, hud_dir, log=log)
+                if self.cancelled:
+                    raise RuntimeError("cancelled")
+                install_traffic_plugin(up, log)  # the front end and HUD live in the plugin
+                ini = os.path.join(project_dir, "Config", "DefaultEngine.ini")
+                # Start New Game (and Free Mode on the phone) opens the exported Liberty City map
+                # when there is one, otherwise the project's own startup level
+                map_name = self.map_name.get().strip() or "LibertyCity"
+                if os.path.isfile(os.path.join(project_dir, "Content", "GTAIV", "Maps", map_name + ".umap")):
+                    start = "/Game/GTAIV/Maps/" + map_name
+                else:
+                    start = startup_level(ini)
+                steps = ([("unreal_frontend.py", {"frontend_dir": fe_dir, "start_level": start})]
+                         if self.ui_frontend.get() else []) + \
+                        ([("unreal_hud.py", {"hud_dir": hud_dir})] if self.ui_hud.get() else [])
+                for i, (script, job) in enumerate(steps):
+                    job_path = os.path.join(out, "job_%d.json" % i)
+                    with open(job_path, "w", encoding="utf-8") as f:
+                        json.dump(job, f)
+                    self._pass = {"more": None, "failed": None}
+                    self._result = None
+                    self.q.put(("progress", (0.3 + 0.6 * i / len(steps), "Importing into Unreal")))
+                    self._run_unreal_once(project_dir, job_path, os.path.join(out, "unreal_%d.log" % i), script)
+                    if self.cancelled:
+                        raise RuntimeError("cancelled")
+                    if self._pass["failed"]:
+                        raise RuntimeError(self._pass["failed"])
+                    if not isinstance(self._result, int):
+                        raise RuntimeError("Unreal stopped before finishing %s (see %s)" % (script, out))
+                if self.ui_frontend.get() and self.ui_startup.get():
+                    set_startup_level(ini, STARTUP_MAP, log)
+                self._result = 1
+                self.q.put(("exit", 0))
+            except Exception as e:
+                if not self.cancelled:
+                    self.q.put(("failed", str(e)))
+                self.q.put(("exit", -1))
+            finally:
+                self._worker_busy = False
+        threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
     def _grid_cols(frame):
@@ -543,7 +1008,8 @@ class App(tk.Tk):
         self.cancel_btn = self._btn(bar, "Cancel", self.cancel, icon="cancel")
         self.cancel_btn.pack(side="left", padx=(0, 8))
         self.cancel_btn.state(["disabled"])
-        self.export_btn = self._btn(bar, "Export", self.export, accent=True, icon="play")
+        self.export_btn = self._btn(bar, "Export", lambda: self.export_ui() if self._last_kind == "ui"
+                                    else self.export(self._last_kind), accent=True, icon="play")
         self.export_btn.pack(side="left")
 
         row = tk.Frame(page, bg=CONTENT)
@@ -630,11 +1096,12 @@ class App(tk.Tk):
         ttk.Radiobutton(uo, text="Separate actors (editable, best for a few districts)", variable=self.ue_mode,
                         value="ACTORS", style="Card.TRadiobutton").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self._switches(u, 4, (("Collision (walkable)", self.collision), ("Nanite", self.nanite),
+                              ("LODs + draw distances (better FPS)", self.map_lods),
                               ("Keep intermediate files", self.keep_files),
-                              ("Traffic (cars driving the roads)", self.traffic),
-                              ("Characters & weapons", self.characters)))
-        self._label(u, "Characters & weapons: all 345 peds plus Niko and 79 weapons. In a Game Animation Sample "
-                       "project they also walk the sidewalks, and you play as Niko.", font=self.f.small, fg=FG3,
+                              ("Traffic (cars driving the roads)", self.traffic)))
+        self._label(u, "Characters, Niko and weapons are exported from the Characters tab. In a Game Animation "
+                       "Sample project the player becomes Niko, and the peds walk the sidewalks of an exported map.",
+                    font=self.f.small, fg=FG3,
                     wraplength=820).grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         d = self._settings_card(p, "Map detail", "Less detail runs faster (e.g. in skate). GTA's own LOD models "
@@ -656,8 +1123,9 @@ class App(tk.Tk):
     # ------------------------------------------------------------ state
     def _target_changed(self):
         ue = self.target.get() == "UNREAL"
-        for b in (self.export_btn, self.export_btn2):
-            b.configure(text="%s  %s" % (ICONS["play"], "Export to Unreal" if ue else "Export to Blender"))
+        self.export_btn2.configure(text="%s  %s" % (ICONS["play"], "Export map to Unreal" if ue
+                                                    else "Export map to Blender"))
+        self.export_btn.configure(text="%s  Export again" % ICONS["play"])
         self.open_btn.configure(text="%s  %s" % (ICONS["open"], "Open in Unreal" if ue else "Open in Blender"))
         if ue and os.path.isfile(self._map_file()) and not self._running():
             self.open_btn.state(["!disabled"])
@@ -781,6 +1249,21 @@ class App(tk.Tk):
                 for _, arc in data.archives:
                     arc.close()
                 self.q.put(("scanned", counts))
+                from gtaiv_exporter.peds import PedArchive
+                pa = PedArchive(gd, data.key)
+                items = [("ped:player", "story")] if pa._player_archive() else []
+                items += [("ped:" + n, char_group("ped", n)) for n in pa.ped_names()]
+                items += [("item:" + n, char_group("item", n)) for n in pa.weapon_names()]
+                pa.close()
+                try:
+                    from gtaiv_exporter.vehicles import load_vehicle_defs
+                    vdefs, _ = load_vehicle_defs(gd)
+                    items += [("veh:" + n, char_group("veh", n)) for n, d in vdefs.items() if d.kind == "car"]
+                except Exception as e:
+                    self.q.put(("log", "Couldn't list the vehicles: %s" % e))
+                order = {g: i for i, (g, _) in enumerate(CHAR_GROUPS)}
+                items.sort(key=lambda kg: (order[kg[1]], kg[0] != "ped:player", natural_key(kg[0])))
+                self.q.put(("chars", (data.key, items)))
             except Exception as e:
                 self.q.put(("scan_failed", str(e)))
         threading.Thread(target=work, daemon=True).start()
@@ -917,6 +1400,8 @@ class App(tk.Tk):
     def _selected(self):
         return [a for a, v in self.area_vars.items() if v.get()]
 
+
+
     def _estimate(self):
         n = sum(self._count(a) for a in self._selected())
         frac = min(1.0, n / FULL_MAP_PLACEMENTS)
@@ -955,9 +1440,9 @@ class App(tk.Tk):
                 len(self.area_counts), len({group_of(a) for a in self.area_counts}), "{:,}".format(n),
                 "{:,}".format(total)))
             self.all_btn.configure(text="%s  Select all (%d)" % (ICONS["add"], len(self.area_counts)))
-        for b in (self.export_btn, self.export_btn2):
-            if not self._running():
-                b.state(["!disabled"] if n else ["disabled"])
+        if not self._running():
+            self.export_btn2.state(["!disabled"] if n else ["disabled"])
+            self.export_btn.state(["!disabled"] if getattr(self, "_last_kind", None) else ["disabled"])
 
         # disk card
         d = self.card_disk
@@ -1013,8 +1498,15 @@ class App(tk.Tk):
         x["note"].configure(text=", ".join(on) if on else "Untextured buildings and streets only")
 
         # export page
-        self.exp_sub.configure(text="%s · %s · %s placements" % (
-            "Unreal Engine" if ue else "Blender", plural(len(sel), "district"), "{:,}".format(n)))
+        if getattr(self, "_last_kind", None) in GALLERIES:
+            peds, items = getattr(self, "_char_pick", (None, None))
+            self.exp_sub.configure(text="Unreal Engine · " + (
+                plural(len(peds or []), "character") if self._last_kind == "characters"
+                else plural(len(items or []), "vehicle") if self._last_kind == "vehicles"
+                else plural(len(items or []), "weapon/item")))
+        else:
+            self.exp_sub.configure(text="%s · %s · %s placements" % (
+                "Unreal Engine" if ue else "Blender", plural(len(sel), "district"), "{:,}".format(n)))
         sv = self.summary_vals
         sv["Target"].configure(text="Unreal Engine" if ue else "Blender")
         names = ", ".join(sorted(sel, key=natural_key))
@@ -1031,7 +1523,12 @@ class App(tk.Tk):
     def _running(self):
         return self.proc is not None or getattr(self, "_worker_busy", False)
 
-    def export(self):
+    def export(self, kind="map"):
+        if kind in GALLERIES and self.target.get() != "UNREAL":
+            if not messagebox.askyesno(APP_NAME, "%s are exported to Unreal Engine.\n\n" % GALLERIES[kind][0] +
+                                                 "Switch \"Export to\" to Unreal Engine?"):
+                return
+            self.target.set("UNREAL")
         g_ok, t_ok = self._check_paths()
         ue = self.target.get() == "UNREAL"
         if not g_ok:
@@ -1041,11 +1538,26 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, "Pick an Unreal project (.uproject), the Unreal Editor and a valid level name."
                                  if ue else "Blender wasn't found. Install Blender 4.2 or newer, or point to blender.exe.")
             return
-        areas = self._selected()
-        if not areas:
-            messagebox.showerror(APP_NAME, "Select at least one district.")
+        chars_only = kind in GALLERIES  # characters or weapons, no map
+        areas = [] if chars_only else self._selected()
+        peds, items = self._char_selection() if chars_only else (None, None)
+        if kind == "characters":
+            items = []
+        elif kind == "weapons":
+            peds = []
+            items = [i for i in items if not i.startswith("veh:")]
+        elif kind == "vehicles":
+            peds = []
+            items = [i for i in items if i.startswith("veh:")]
+        if chars_only and not (peds or items):
+            messagebox.showerror(APP_NAME, "Add at least one item on the %s tab." % GALLERIES[kind][0])
+            return
+        if not chars_only and not areas:
+            messagebox.showerror(APP_NAME, "Select at least one district on the Map tab.")
             return
         n, size = self._estimate()
+        if chars_only:
+            n, size = 0, 0.6e9 * (len(peds) + len(items) / 10) / 346 + 50e6
         out_dir = self._out_dir()
         if not ue:
             out = self.output.get().strip()
@@ -1069,7 +1581,7 @@ class App(tk.Tk):
                               "otherwise the import can't save its files.\n\nContinue anyway?"):
                 return
             mp = os.path.join(out_dir, "Content", "GTAIV", "Maps", self.map_name.get().strip() + ".umap")
-            if os.path.exists(mp) and not messagebox.askyesno(
+            if not chars_only and os.path.exists(mp) and not messagebox.askyesno(
                     APP_NAME, "The level %s already exists in this project. Replace its contents?"
                     % self.map_name.get().strip()):
                 return
@@ -1077,6 +1589,9 @@ class App(tk.Tk):
             return
 
         self._persist()
+        self._chars_only_run = chars_only
+        self._last_kind = kind
+        self._char_pick = (peds, items)
         self._result = None
         self.pct.configure(fg=FG)
         self.cancelled = False
@@ -1086,8 +1601,14 @@ class App(tk.Tk):
         self.pct.configure(text="0%")
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
-        self._log("Exporting %d districts (%s placements) to %s"
-                  % (len(areas), "{:,}".format(n), "Unreal" if ue else out))
+        if chars_only:
+            self._log("Exporting %s to Unreal (no map)" % (plural(len(peds), "character") if kind == "characters"
+                                                           else plural(len(items), "vehicle") if kind == "vehicles"
+                                                           else plural(len(items), "weapon/item")))
+            self._update_summary()
+        else:
+            self._log("Exporting %d districts (%s placements) to %s"
+                      % (len(areas), "{:,}".format(n), "Unreal" if ue else out))
         if ue:
             self._export_unreal(areas)
         else:
@@ -1149,9 +1670,18 @@ class App(tk.Tk):
                 self._convert_for_unreal(areas, export_dir)
                 if self.cancelled:
                     raise RuntimeError("cancelled")
-                if self.traffic.get() or self.characters.get():  # the plugin also runs the pedestrians
+                chars = self._last_kind == "characters"
+                has_peds = os.path.isfile(os.path.join(project_dir, "Content", "GTAIV", "Characters", "GM_GTAIV.uasset"))
+                if self.traffic.get() or chars or has_peds or self._last_kind == "vehicles":  # the plugin also runs the pedestrians
                     install_traffic_plugin(self.uproject.get(), lambda m: self.q.put(("log", m)))
+                if chars:
+                    self._reset_old_characters(project_dir)
+                if self._last_kind == "vehicles" and self.radio.get():
+                    self._export_radio(project_dir, export_dir)
                 self._run_unreal_passes(project_dir, export_dir)
+                if chars and isinstance(self._result, int):
+                    with open(self._characters_marker(project_dir), "w") as f:
+                        f.write(str(CHARACTERS_VERSION))
                 if not self.keep_files.get() and isinstance(self._result, int):
                     shutil.rmtree(export_dir, ignore_errors=True)
                 self.q.put(("exit", 0))
@@ -1163,13 +1693,55 @@ class App(tk.Tk):
                 self._worker_busy = False
         threading.Thread(target=work, daemon=True).start()
 
+    def _export_radio(self, project_dir, export_dir):
+        """GTA IV's radio: the stations' audio straight into Content/GTAIV/RadioData (the game's own
+        compressed data, decoded by the plugin while it plays), the logos for the Unreal pass."""
+        from gtaiv_exporter import radio
+        log = lambda m: self.q.put(("log", m))
+        key_path = os.path.join(SETTINGS_DIR, "gta4_key.bin")
+        if os.path.isfile(key_path):
+            key = open(key_path, "rb").read()
+        else:
+            from gtaiv_exporter import mapdata
+            key = mapdata.GameData(self.game_dir.get(), log=log, key_cache=key_path).key
+        data_dir = os.path.join(project_dir, "Content", "GTAIV", "RadioData")
+        shutil.rmtree(data_dir, ignore_errors=True)
+        self.q.put(("progress", (UE_CONVERT_SHARE, "Copying the radio stations")))
+        m = radio.export_radio(self.game_dir.get(), key, data_dir, os.path.join(export_dir, "radio_logos"), log=log)
+        with open(os.path.join(export_dir, "radio_unreal.json"), "w", encoding="utf-8") as f:
+            json.dump({"stations": [{"id": s["id"], "name": s["name"], "logo": s["logo"]} for s in m["stations"]],
+                       "logos": m["logos"]}, f)
+        stage_radio_data(project_dir, log)
+
+    @staticmethod
+    def _characters_marker(project_dir):
+        return os.path.join(project_dir, "Saved", "GTAIVExporter_characters.txt")
+
+    def _reset_old_characters(self, project_dir):
+        """Characters imported by an older version are deleted (only our own folder) so they are
+        imported again, with a correct shared skeleton and retargeting rig."""
+        chars = os.path.join(project_dir, "Content", "GTAIV", "Characters")
+        try:
+            current = open(self._characters_marker(project_dir)).read().strip() == str(CHARACTERS_VERSION)
+        except OSError:
+            current = False
+        if current or not os.path.isdir(chars):
+            return
+        self.q.put(("log", "Rebuilding the characters imported by an older version (Content/GTAIV/Characters)"))
+        shutil.rmtree(chars, ignore_errors=True)
+        if os.path.isdir(chars):
+            raise RuntimeError("Couldn't replace Content/GTAIV/Characters: close Unreal Editor and export again.")
+
     def _convert_for_unreal(self, areas, export_dir):
         """Step 1 (no Unreal needed): game files -> glTF + PNG + JSON. Reused when a previous
         run with the same selection didn't finish, so a retry goes straight to importing."""
         from gtaiv_exporter.unreal_export import UnrealExporter
-        sig = {"areas": sorted(areas), "detail": self.detail.get(), "interiors": self.interiors.get(),
-               "lights": self.lights.get(), "traffic": self.traffic.get(), "characters": self.characters.get(),
-               "textures": self.textures.get(), "v": 7}
+        chars_only = self._chars_only_run
+        peds, items = self._char_pick
+        sig = {"areas": sorted(areas), "peds": sorted(peds or []), "items": sorted(items or []),
+               "detail": self.detail.get(), "interiors": self.interiors.get(),
+               "lights": self.lights.get(), "traffic": self.traffic.get(), "kind": self._last_kind,
+               "textures": self.textures.get(), "lods": self.map_lods.get(), "v": 13}
         sig_path = os.path.join(export_dir, "selection.json")
         try:
             if (json.load(open(sig_path, encoding="utf-8")) == sig
@@ -1184,11 +1756,15 @@ class App(tk.Tk):
                            self.textures.get(), key_cache=os.path.join(SETTINGS_DIR, "gta4_key.bin"),
                            log=lambda m: self.q.put(("log", m)), detail=self.detail.get(),
                            interiors=self.interiors.get(), lights=self.lights.get(),
-                           traffic=self.traffic.get(), characters=self.characters.get()).run(
+                           traffic=self.traffic.get(), characters=chars_only,
+                           characters_only=chars_only, ped_filter=peds, weapon_filter=items,
+                           distances=self.map_lods.get() and not chars_only).run(
             progress=lambda f: self.q.put(("progress", (UE_CONVERT_SHARE * f, "Converting models"))))
         with open(sig_path, "w", encoding="utf-8") as f:
             json.dump(sig, f)
-        self.q.put(("log", "Converted %s placements" % "{:,}".format(n)))
+        self.q.put(("log", ("Converted %d %s" % (n, {"vehicles": "vehicles", "weapons": "weapons/items"}.get(self._last_kind, "characters")))
+                    if chars_only
+                    else "Converted %s placements" % "{:,}".format(n)))
 
     def _run_unreal_passes(self, project_dir, export_dir):
         """Step 2: import with headless Unreal, a few mesh batches per editor process.
@@ -1205,7 +1781,8 @@ class App(tk.Tk):
             pass_no += 1
             job = {"export_dir": export_dir, "mode": self.ue_mode.get(), "nanite": self.nanite.get(),
                    "collision": self.collision.get(), "map_name": self.map_name.get().strip(),
-                   "stage": "all", "first_pass": first, "max_batches": chunk, "lights": self.lights.get()}
+                   "stage": "all", "first_pass": first, "max_batches": chunk, "lights": self.lights.get(),
+                   "lods": self.map_lods.get()}
             with open(job_path, "w", encoding="utf-8") as f:
                 json.dump(job, f)
             log_path = os.path.join(export_dir, "unreal_pass_%02d.log" % pass_no)
@@ -1237,10 +1814,10 @@ class App(tk.Tk):
             self.q.put(("log", "Retrying from where it stopped (attempt %d of %d)…"
                         % (failures + 1, UE_MAX_RETRIES)))
 
-    def _run_unreal_once(self, project_dir, job_path, log_path):
+    def _run_unreal_once(self, project_dir, job_path, log_path, script="unreal_runner.py"):
         cmd = ('"%s" "%s" -run=pythonscript -script="%s" -unattended -nop4 -nosplash -NoSound '
                '-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities -abslog="%s"'
-               % (self._unreal_cmd(), self.uproject.get(), os.path.join(HERE, "unreal_runner.py"), log_path))
+               % (self._unreal_cmd(), self.uproject.get(), os.path.join(HERE, script), log_path))
         env = dict(os.environ, GTA4_UE_JOB=job_path)
         # keep Unreal's derived-data cache with the project (the system drive may be full)
         env["UE-LocalDataCachePath"] = os.path.join(project_dir, "DerivedDataCache")
@@ -1326,7 +1903,8 @@ class App(tk.Tk):
 
     def _busy(self, busy):
         st = ["disabled"] if busy else ["!disabled"]
-        for b in (self.export_btn, self.export_btn2, self.rescan_btn):
+        for b in (self.export_btn, self.export_btn2, self.rescan_btn, self.ui_export_btn) + \
+                tuple(g["export_btn"] for g in self.gal.values()):
             b.state(st)
         self.cancel_btn.state(["!disabled"] if busy else ["disabled"])
         if busy:
@@ -1340,10 +1918,13 @@ class App(tk.Tk):
             "output": self.output.get(), "uproject": self.uproject.get(), "unreal": self.unreal.get(),
             "map_name": self.map_name.get(), "mode": self.mode.get(), "ue_mode": self.ue_mode.get(),
             "detail": self.detail.get(), "interiors": self.interiors.get(), "lights": self.lights.get(),
-            "traffic": self.traffic.get(), "characters": self.characters.get(),
+            "traffic": self.traffic.get(), "radio": self.radio.get(),
+            "ui_frontend": self.ui_frontend.get(), "ui_hud": self.ui_hud.get(), "ui_startup": self.ui_startup.get(),
+            "characters_selected": [k for k, v in self.char_vars.items() if v.get()] if self.char_vars
+            else sorted(self._saved_chars or []),
             "textures": self.textures.get(), "normals": self.normals.get(),
             "nanite": self.nanite.get(), "collision": self.collision.get(), "keep_files": self.keep_files.get(),
-            "areas": self._selected(),
+            "map_lods": self.map_lods.get(), "areas": self._selected(),
         })
 
     def open_result(self):
@@ -1370,6 +1951,7 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, "The folder doesn't exist yet; it is created when you export.")
 
     def _on_close(self):
+        self._closing = True
         if self._running():
             if not messagebox.askyesno(APP_NAME, "An export is running. Stop it and quit?"):
                 return
@@ -1393,6 +1975,16 @@ class App(tk.Tk):
                     self.area_counts = val
                     self._populate_areas(keep_selection=bool(self.area_vars))
                     self.status.configure(text="Found %d districts. Pick what to export." % len(val))
+                elif kind == "chars":
+                    self._game_key, items = val
+                    self._populate_characters(items)
+                elif kind == "preview":
+                    t = self.char_tiles.get(val)
+                    img = self._preview_image(val)
+                    if t and img:
+                        t["img"].configure(image=img)
+                    if len(self._previews) % 10 == 0 or self._preview_thread is None:
+                        self._char_changed()
                 elif kind == "scan_failed":
                     self.progress.stop()
                     self.rescan_btn.state(["!disabled"])
@@ -1429,8 +2021,19 @@ class App(tk.Tk):
             where = ("level /Game/GTAIV/Maps/%s in %s" % (self.map_name.get().strip(),
                                                          os.path.basename(self.uproject.get()))
                      if ue else self.output.get())
-            msg = "Done in %s: %s placements saved to %s" % (
-                self._dur(time.time() - self.start_time), "{:,}".format(self._result), where)
+            if getattr(self, "_last_kind", None) == "ui":
+                msg = "Done in %s: GTA IV's startup, menus and HUD are in %s (Content/GTAIV/Frontend and HUD)" % (
+                    self._dur(time.time() - self.start_time), os.path.basename(self.uproject.get()))
+            elif getattr(self, "_chars_only_run", False):
+                what, dest = (("characters", "Content/GTAIV/Characters") if self._last_kind == "characters"
+                              else ("drivable vehicles", "Content/GTAIV/Meshes (set: Traffic/DA_GTAIV_Vehicles)")
+                              if self._last_kind == "vehicles" else ("weapons/items", "Content/GTAIV/Meshes"))
+                msg = "Done in %s: %s %s imported into %s in %s" % (
+                    self._dur(time.time() - self.start_time), "{:,}".format(self._result), what, dest,
+                    os.path.basename(self.uproject.get()))
+            else:
+                msg = "Done in %s: %s placements saved to %s" % (
+                    self._dur(time.time() - self.start_time), "{:,}".format(self._result), where)
             self.status.configure(text=msg)
             self._log(msg)
             self.open_btn.state(["!disabled"])

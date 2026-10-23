@@ -113,11 +113,42 @@ def _merge(meshes):
     return out if out.finish() else None
 
 
+def standard_facing(sk):
+    """True when the skeleton faces the way GTA IV's peds normally do (its left thigh on +X in
+    Unreal's orientation). One ped (f_m_business_01) has its skeleton turned round against its
+    mesh; it would break the shared skeleton and the animation retargeting."""
+    try:
+        lt = sk.world[sk.names.index("Char_L_Thigh")][0, 3]
+        rt = sk.world[sk.names.index("Char_R_Thigh")][0, 3]
+    except ValueError:
+        return False
+    return lt > rt
+
+
+# GTA IV turns these twist bones in code each frame; on their own they hang off the wrong bone
+# (the upper-arm twists off the clavicle, the forearm twist off the upper arm), so in Unreal the
+# skin weighted to them would stay behind when the arm moves. Re-attach them to the bone they follow.
+TWIST_PARENTS = {
+    "L_UpperArmRoll": "Char_L_UpperArm", "L_ArmRoll": "Char_L_UpperArm", "Char_L_ForeTwist": "Char_L_Forearm",
+    "R_UpperArmRoll": "Char_R_UpperArm", "R_ArmRoll": "Char_R_UpperArm", "Char_R_ForeTwist": "Char_R_Forearm",
+}
+
+
+def fix_twist_bones(sk):
+    for bone, parent in TWIST_PARENTS.items():
+        if bone not in sk.names or parent not in sk.names:
+            continue
+        i, p = sk.names.index(bone), sk.names.index(parent)
+        sk.parents[i] = p
+        sk.local[i] = np.linalg.inv(sk.world[p]) @ sk.world[i]  # same rest pose, new parent
+
+
 def _finish(p, meshes):
     """Merge the body parts and convert to Unreal character conventions."""
     p.mesh = _merge(meshes) if meshes else None
     if p.mesh is None:
         return None
+    fix_twist_bones(p.skeleton)
     add_ground_root(p.skeleton)
     m = p.mesh
     m.positions = m.positions @ TO_UNREAL[:3, :3].T + TO_UNREAL[:3, 3]
@@ -135,12 +166,15 @@ class Ped:
 
 
 class PedArchive:
-    def __init__(self, game_dir, key):
+    def __init__(self, game_dir, key, cutscenes=False):
         self.game_dir, self.key = game_dir, key
         self.archives = []
-        for rel in (os.path.join("pc", "models", "cdimages", "componentpeds.img"),
-                    os.path.join("pc", "models", "cdimages", "weapons.img"),
-                    os.path.join("pc", "models", "cdimages", "pedprops.img")):
+        rels = [os.path.join("pc", "models", "cdimages", "componentpeds.img"),
+                os.path.join("pc", "models", "cdimages", "weapons.img"),
+                os.path.join("pc", "models", "cdimages", "pedprops.img")]
+        if cutscenes:   # the cutscene versions of the story characters (cs_roman_d, ...)
+            rels.append(os.path.join("pc", "anim", "cutsprops.img"))
+        for rel in rels:
             for base in (os.path.join(game_dir, "update"), game_dir):
                 p = os.path.join(base, rel)
                 if os.path.isfile(p):
@@ -206,7 +240,12 @@ class PedArchive:
             if not have:
                 continue
             want = [n for n in have if int(n.split("_")[1]) == variant] or have
-            chosen.append(want[0])
+            pick = want[0]
+            if self._stub(res, comps[pick]):
+                # cutscene characters keep empty 4-vertex placeholders as variant 0 (the cutscene
+                # picks their real clothes): take the first real one
+                pick = next((n for n in have if not self._stub(res, comps[n])), pick)
+            chosen.append(pick)
         meshes = []
         for n in chosen:
             try:
@@ -216,7 +255,71 @@ class PedArchive:
             if m is not None:
                 meshes.append(m)
                 p.parts.append(n)
+        # (still in GTA's orientation here: the game's peds have their left thigh on -X)
+        if meshes and standard_facing(p.skeleton):
+            self._standardize(p, meshes)
         return _finish(p, meshes)
+
+    _standard_names = None
+    _standard_parents = {}
+
+    def _standardize(self, p, meshes):
+        """Cutscene characters (cs_*): modelled facing the other way, on a 90-bone rig with a
+        full face. Turn them round and fold the bones the game's own peds don't have into their
+        nearest kept parent (the face into the head), so they share the peds' skeleton. Their
+        animations already match it (they're baked onto that skeleton)."""
+        if PedArchive._standard_names is None:
+            ref = self.ped("m_y_business_01")
+            PedArchive._standard_names = set(ref.skeleton.names) if ref else set()
+            PedArchive._standard_parents = ({n: (ref.skeleton.names[q] if q >= 0 else None)
+                                             for n, q in zip(ref.skeleton.names, ref.skeleton.parents)} if ref else {})
+        keep_names = PedArchive._standard_names
+        std_parent = PedArchive._standard_parents
+        if not keep_names:
+            return
+        sk = p.skeleton
+        turn = np.diag([-1.0, -1.0, 1.0, 1.0])
+        for m in meshes:
+            m.positions = [x @ turn[:3, :3].T for x in m.positions] if isinstance(m.positions, list) else m.positions @ turn[:3, :3].T
+            m.normals = [x @ turn[:3, :3].T for x in m.normals] if isinstance(m.normals, list) else m.normals @ turn[:3, :3].T
+        world = [turn @ w for w in sk.world]
+        n = len(sk.names)
+        keep = [i for i in range(n) if sk.names[i] in keep_names]
+        new_index = {old: k for k, old in enumerate(keep)}
+
+        def kept(i):
+            while i >= 0 and i not in new_index:
+                i = sk.parents[i]
+            return new_index.get(i, 0)
+        remap = np.array([kept(i) for i in range(n)], np.int32)
+        names, parents, local, wnew = [], [], [], []
+        by_name = {sk.names[i]: i for i in keep}
+        for old in keep:
+            par = sk.parents[old]
+            while par >= 0 and par not in new_index:
+                par = sk.parents[par]
+            # the same parent as the game's peds (the cutscene rig hangs the spine off the pelvis)
+            want = std_parent.get(sk.names[old])
+            if want in by_name and by_name[want] != old:
+                par = by_name[want]
+            names.append(sk.names[old])
+            parents.append(new_index[par] if par >= 0 else -1)
+            wnew.append(world[old])
+            local.append(np.linalg.inv(world[par]) @ world[old] if par >= 0 else world[old])
+        sk.names, sk.parents, sk.local, sk.world = names, parents, local, wnew
+        for m in meshes:
+            if isinstance(m.joints, list):
+                m.joints = [remap[j] for j in m.joints]
+            elif len(m.joints):
+                m.joints = remap[m.joints]
+
+    @staticmethod
+    def _stub(res, d):
+        try:
+            m = drawable.read_drawable(res, d)
+        except Exception:
+            return False
+        return m is not None and len(m.positions) < 20
 
     PLAYER_SLOTS = ("head", "uppr", "lowr", "hand", "feet", "hair", "teef")  # no braces/accessories
 
@@ -274,6 +377,22 @@ class PedArchive:
             except Exception:
                 pass
         return out
+
+    def weapon_bones(self, name):
+        """The weapon model's helper bones (gun_grip, gun_muzzle, ...) as 4x4 matrices in the
+        model's mesh space (relative to its root bone)."""
+        d = self.read(name + ".wdr")
+        if d is None:
+            return {}
+        res = Resource(d)
+        skel = res.ptr(0x0C)
+        if skel is None:
+            return {}
+        sk = read_skeleton(res, skel)
+        if not sk.world:
+            return {}
+        inv_root = np.linalg.inv(sk.world[0])
+        return {n: inv_root @ w for n, w in zip(sk.names, sk.world)}
 
     def weapon(self, name):
         d = self.read(name + ".wdr")

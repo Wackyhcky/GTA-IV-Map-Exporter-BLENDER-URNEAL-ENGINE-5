@@ -18,7 +18,7 @@ NOT_TRAFFIC = re.compile(r"^(police|police2|noose|nstockade|fbi|ambulance|firetr
 
 class VehicleDef:
     __slots__ = ("name", "txd", "kind", "handling", "game_name", "frequency", "wheel_front", "wheel_rear",
-                 "flags", "colors")
+                 "flags", "colors", "anim_group")
 
     def __init__(self, f):
         self.name = f[0].lower()
@@ -31,6 +31,7 @@ class VehicleDef:
         self.wheel_rear = _num(f[10], 0.3)
         self.flags = f[15].lower() if len(f) > 15 else ""
         self.colors = []   # [(rgb1, rgb2, rgb3)] possible paint combos
+        self.anim_group = f[5].lower() if len(f) > 5 else "veh@std"   # in-car animations, e.g. veh@low
 
     @property
     def in_traffic(self):
@@ -107,6 +108,8 @@ class VehicleModel:
         self.body = None
         self.wheels = {}
         self.wheel_slots = []
+        self.seats = {}    # seat bone (seat_dside_f = driver) -> (x, y, z)
+        self.bones = {}    # bone name -> (index, (x, y, z))
 
 
 WHEEL_BONES = ("wheel_lf", "wheel_rf", "wheel_lm1", "wheel_rm1", "wheel_lm2", "wheel_rm2", "wheel_lr", "wheel_rr")
@@ -133,6 +136,11 @@ def load_vehicle_model(data):
     count = res.u16(skel + 0x14)
     names = [res.cstr(res.ptr(bones + i * 0xE0)).lower() for i in range(count)]
     world = drawable._bone_world_matrices(res, skel)
+    for i, name in enumerate(names):
+        if i < len(world):
+            out.bones[name] = (i, tuple(float(c) for c in world[i][:3, 3]))
+        if name.startswith("seat_") and i < len(world):
+            out.seats[name] = tuple(float(c) for c in world[i][:3, 3])
     seen = set()
     for off in range(0x90, len(res.sys) - 4, 4):
         d = res.ptr(off)
@@ -165,6 +173,55 @@ def load_vehicle_model(data):
             pos = tuple(float(c) for c in world[i][:3, 3])
             mesh = front if name in ("wheel_lf", "wheel_rf") else rear
             out.wheel_slots.append((name, pos, mesh, name.startswith("wheel_r")))
+    return out
+
+
+def _subset(mesh, face_mask):
+    """A new finished drawable.Mesh with only the masked triangles (materials kept as they are)."""
+    m = drawable.Mesh()
+    faces = mesh.faces[face_mask]
+    used = np.unique(faces)
+    remap = np.full(len(mesh.positions), -1, np.int64)
+    remap[used] = np.arange(len(used))
+    m.positions = mesh.positions[used]
+    m.normals = mesh.normals[used]
+    m.uvs = mesh.uvs[used]
+    m.colors = mesh.colors[used] if len(mesh.colors) == len(mesh.positions) else mesh.colors
+    m.faces = remap[faces]
+    m.face_mats = mesh.face_mats[face_mask]
+    m.materials = mesh.materials
+    m.textures = mesh.textures
+    m.joints, m.weights, m.skinned = [], [], False
+    return m
+
+
+DOOR_BONES = {"door_lf": ("door_dside_f", "window_lf")}
+
+
+def split_parts(vm, parts=DOOR_BONES):
+    """Cuts parts (e.g. the driver's door with its window) out of the body by the bone each vertex
+    follows (its strongest weight). -> {part: (mesh in the part bone's space, bone position)};
+    vm.body loses those triangles."""
+    body = vm.body
+    if body is None or not body.skinned or not len(body.joints):
+        return {}
+    dom = body.joints[np.arange(len(body.joints)), body.weights.argmax(1)]
+    out = {}
+    for part, bone_names in parts.items():
+        ids = [vm.bones[b][0] for b in bone_names if b in vm.bones]
+        if not ids or bone_names[0] not in vm.bones:
+            continue
+        on = np.isin(dom, ids)
+        mask = on[body.faces].all(axis=1)
+        if mask.sum() < 8:
+            continue
+        piece = _subset(body, mask)
+        hinge = np.array(vm.bones[bone_names[0]][1], np.float32)
+        piece.positions = (piece.positions - hinge).astype(np.float32)
+        out[part] = (piece, tuple(float(c) for c in hinge))
+        body = _subset(body, ~mask)
+    if out:
+        vm.body = body
     return out
 
 
@@ -209,3 +266,39 @@ def paint_slot(shader):
     """gta_vehicle_paint1/2/3 -> 1/2/3 (which carcols colour tints this material), else 0."""
     m = re.search(r"vehicle_paint(\d)", shader.lower())
     return int(m.group(1)) if m else 0
+
+
+# handling.dat columns (after the name), see the file's header
+HANDLING_FIELDS = ("mass", "drag_mult", "submerged", "com_x", "com_y", "com_z",
+                   "drive_bias", "gears", "drive_force", "drive_inertia", "max_speed", "brake_force",
+                   "brake_bias", "handbrake_force", "steering_lock",
+                   "traction_max", "traction_min", "traction_lateral", "traction_spring_delta", "traction_bias",
+                   "susp_force", "susp_comp_damp", "susp_rebound_damp", "susp_upper", "susp_lower", "susp_raise",
+                   "susp_bias", "dmg_collision", "dmg_weapon", "dmg_deformation", "dmg_engine",
+                   "seat_offset", "value", "model_flags", "handling_flags", "anim_group")
+
+
+def load_handling(game_dir):
+    """{HANDLING_ID: {field: value}} from common/data/handling.dat (cars; boats, bikes and
+    aircraft have their own sections and are skipped)."""
+    path = _data_file(game_dir, os.path.join("common", "data", "handling.dat"))
+    out = {}
+    if path is None:
+        return out
+    for line in open(path, encoding="latin-1"):
+        if not line or line[0] in ";#!$%^&*" or not line[0].isalnum():
+            continue
+        tok = line.split()
+        if len(tok) < len(HANDLING_FIELDS) + 1:
+            continue
+        row = {}
+        for k, v in zip(HANDLING_FIELDS, tok[1:]):
+            if k in ("model_flags", "handling_flags"):
+                try:
+                    row[k] = int(v, 16)
+                except ValueError:
+                    row[k] = 0
+            else:
+                row[k] = _num(v, 0.0)
+        out[tok[0].upper()] = row
+    return out

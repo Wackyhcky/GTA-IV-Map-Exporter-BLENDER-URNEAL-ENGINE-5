@@ -88,6 +88,7 @@ private:
 		float Side = 1.f;        // +1 walks the right-hand sidewalk of From->To, -1 the left
 		FVector Target = FVector::ZeroVector;
 		FVector LastLocation = FVector::ZeroVector;
+		float DeadTime = 0.f;
 		float StuckTime = 0.f;
 		float GroundZ = 0.f;
 	};

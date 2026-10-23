@@ -1,4 +1,5 @@
 ﻿#include "GTAIVPedManager.h"
+#include "GTAIVPlayerComponent.h"
 
 #include "AIController.h"
 #include "Components/CapsuleComponent.h"
@@ -327,7 +328,7 @@ void AGTAIVPedManager::Tick(float DeltaSeconds)
 	}
 	APawn* Player = UGameplayStatics::GetPlayerPawn(this, 0);
 	PlayerCheckTimer -= DeltaSeconds;
-	if (Player && PlayerMesh && PlayerCheckTimer <= 0.f)
+	if (Player && PlayerMesh && PlayerCheckTimer <= 0.f && !Player->FindComponentByClass<UGTAIVPlayerComponent>())
 	{
 		DressPlayer(Player);
 		PlayerCheckTimer = 0.5f;
@@ -349,6 +350,21 @@ void AGTAIVPedManager::Tick(float DeltaSeconds)
 			|| Pawn->GetActorLocation().Z < P.GroundZ - 800.f)  // fell through a gap in the collision
 		{
 			RemoveAgent(i);
+			continue;
+		}
+		if (Pawn->Tags.Contains(TEXT("GTAIV_Fleeing")) || Pawn->Tags.Contains(TEXT("GTAIV_Fighting")))
+		{
+			P.LastLocation = Pawn->GetActorLocation();  // its brain drives it (running away / fighting)
+			P.StuckTime = 0.f;
+			continue;
+		}
+		if (Pawn->Tags.Contains(TEXT("GTAIV_Dead")))  // shot: lies there for a minute
+		{
+			P.DeadTime += DeltaSeconds;
+			if (P.DeadTime > 60.f)
+			{
+				RemoveAgent(i);
+			}
 			continue;
 		}
 		const FVector Loc = Pawn->GetActorLocation();

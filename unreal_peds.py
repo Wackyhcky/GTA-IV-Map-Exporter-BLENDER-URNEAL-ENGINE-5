@@ -268,6 +268,8 @@ def build_game_mode(folder, ped_class, log=print):
     ped_path = ped_class.get_path_name()
     lst = [c for c in lst if ped_path not in str(c)]
     cdo.set_editor_property("VisualOverrides_Soft", [ped_class] + lst)
+    if EAL.does_asset_exist("/Game/GTAIV/HUD/DA_GTAIV_Hud") and hasattr(unreal, "GTAIVPlayerHUD"):
+        cdo.set_editor_property("hud_class", unreal.GTAIVPlayerHUD.static_class())  # the GTA IV HUD, if exported
     EAL.save_loaded_asset(bp, only_if_is_dirty=False)
     log("LOG Built %s (GTA peds as GASP visual override)" % path)
     return bp.generated_class()

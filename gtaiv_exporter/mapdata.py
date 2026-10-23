@@ -35,7 +35,7 @@ class ModelDef:
 
 
 class Instance:
-    __slots__ = ("hash", "pos", "rot", "lod", "wpl", "index", "is_lod", "interior")
+    __slots__ = ("hash", "pos", "rot", "lod", "wpl", "index", "is_lod", "interior", "parent")
 
     def __init__(self, hash_, pos, rot, lod, wpl, index):
         self.hash = hash_
@@ -46,12 +46,19 @@ class Instance:
         self.index = index
         self.is_lod = False
         self.interior = None  # interior (MLO) name for objects that belong to one
+        self.parent = None    # the LOD (or SLOD) placement that stands in for this one far away
 
 
 def _q_true(r):
     """Stored (x, y, z, w) -> actual rotation (w, x, y, z). WPL and MLO entries store the inverse."""
     x, y, z, w = r
     return (w, -x, -y, -z)
+
+
+def _q_stored(r):
+    """Stored (x, y, z, w) -> rotation (w, x, y, z), for interiors (MLOs) and their entities."""
+    x, y, z, w = r
+    return (w, x, y, z)
 
 
 def _q_mul(a, b):
@@ -323,11 +330,14 @@ class GameData:
                     if mlo is None or inst.hash in self.models:
                         continue
                     n_int += 1
-                    q = _q_true(inst.rot)
+                    # unlike ordinary placements, an interior's rotation and its entities' rotations
+                    # are stored as they are, not inverted (checked against the subway: its tunnel
+                    # sections are interiors and only join up end to end this way)
+                    q = _q_stored(inst.rot)
                     for h, epos, erot in mlo.entities:
                         off = _q_rotate(q, epos)
                         world = (inst.pos[0] + off[0], inst.pos[1] + off[1], inst.pos[2] + off[2])
-                        w, x, y, z = _q_mul(q, _q_true(erot))
+                        w, x, y, z = _q_mul(q, _q_stored(erot))
                         child = Instance(h, world, (-x, -y, -z, w), -1, inst.wpl, -1)
                         child.interior = mlo.name
                         extra.append(child)
@@ -400,7 +410,7 @@ def model_size(mesh):
     return float((mesh.positions.max(0) - mesh.positions.min(0)).max())
 
 
-def select_detail(gd, insts, area, detail):
+def select_detail(gd, insts, area, detail, with_lods=False):
     """Choose placements for one area at a detail level.
 
     Returns [(Instance, min_size)]: the placement is kept only if its model is at
@@ -410,6 +420,10 @@ def select_detail(gd, insts, area, detail):
     low-poly LOD stand-in in the area's main WPL, and LODs point to SLOD models
     that cover whole blocks. Many objects have no stand-in; in the low levels
     the large ones are kept so nothing is missing, small props are dropped.
+
+    with_lods: GTA IV's own distance system. The full-detail objects are kept as above and
+    their LOD stand-ins (and the LODs' SLODs) come along too; each placement's `parent` is
+    set, so the importer can show a parent exactly where its children's draw distance ends.
     """
     detail = detail if detail in DETAIL_KEYS else "FULL"
     min_hd = dict((d[0], d[2]) for d in DETAIL_LEVELS)[detail]
@@ -423,7 +437,29 @@ def select_detail(gd, insts, area, detail):
         return gd.models[i.hash].name.startswith("slod")
 
     hd = [i for i in insts if not i.is_lod]
+    for i in insts:
+        i.parent = None
+    for i in hd:
+        parent = by_index.get(i.lod) if i.wpl != main_name else None
+        if parent is not None and parent.is_lod and not is_slod(parent):
+            i.parent = parent
+    for i in insts:
+        if i.is_lod and not is_slod(i):
+            parent = by_index.get(i.lod)
+            if parent is not None and parent is not i and parent.is_lod and is_slod(parent):
+                i.parent = parent
+
+    def with_slods(rows):
+        slods = {}
+        for r in rows:
+            p = r[0].parent
+            if p is not None and r[0].is_lod and is_slod(p):
+                slods[id(p)] = p
+        return rows + [(i, 0.0) for i in slods.values()]
+
     if detail in ("FULL", "HIGH", "MEDIUM"):
+        if with_lods:
+            return with_slods([(i, min_hd) for i in hd] + [(i, 0.0) for i in insts if i.is_lod and not is_slod(i)])
         return [(i, min_hd) for i in hd]
 
     out = []
@@ -434,7 +470,7 @@ def select_detail(gd, insts, area, detail):
             out.append((i, min_hd))
     lods = [i for i in insts if i.is_lod and not is_slod(i)]
     if detail == "LOW":
-        return out + [(i, 0.0) for i in lods]
+        return with_slods(out + [(i, 0.0) for i in lods]) if with_lods else out + [(i, 0.0) for i in lods]
     # VERYLOW: an LOD's SLOD parent replaces it; LODs without one stay
     slods = {}
     for i in lods:

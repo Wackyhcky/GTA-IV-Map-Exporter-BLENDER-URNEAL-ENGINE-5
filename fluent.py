@@ -24,7 +24,7 @@ OK, BAD, WARN = "#6ccb5f", "#ff99a4", "#fce100"
 ICONS = {
     "menu": "", "grid": "", "list": "", "settings": "", "info": "",
     "search": "", "add": "", "refresh": "", "play": "", "star": "",
-    "globe": "", "folder": "", "open": "", "cancel": "", "check": "",
+    "globe": "", "person": "", "folder": "", "open": "", "cancel": "", "car": "", "check": "",
 }
 
 
